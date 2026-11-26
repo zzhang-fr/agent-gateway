@@ -14,6 +14,7 @@ it only depends on ``openjiuwen.core.events`` and its own modules.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import inspect
 import logging
@@ -48,7 +49,7 @@ from agent_gateway.extensions_v2 import bootstrap
 from agent_gateway.extensions_v2.builtin.router import GatewayLocalRouter, LocalRequest
 from agent_gateway.extensions_v2.config import GatewayExtensionConfig
 from agent_gateway.extensions_v2.loader import LoadedPackage, load_gateway_packages, release_package_modules
-from agent_gateway.extensions_v2.registry import HandlerDeclaration
+from agent_gateway.extensions_v2.registry import ON_FAILURE_BLOCK, HandlerDeclaration
 from agent_gateway.extensions_v2.models import (
     EVENT_GATEWAY_REQUEST,
     EVENT_GATEWAY_DISCONNECT,
@@ -73,6 +74,16 @@ logger = logging.getLogger(__name__)
 
 #: A frame must never be blocked by an extension for longer than this.
 REQUEST_TIMEOUT_S = 5.0
+#: Error code of a frame refused because a handler declared ``on_failure="block"`` failed.
+CODE_EXTENSION_FAILED = "EXTENSION_FAILED"
+#: HTTP status of such a refusal, as the HTTP path answers a failed chain.
+STATUS_EXTENSION_FAILED = 503
+
+#: Packages whose blocking ``gateway.request`` handler was still running when the
+#: current frame's chain was cancelled; set by ``intercept`` for one frame.
+_BLOCKING_IN_FLIGHT: contextvars.ContextVar[set[str] | None] = contextvars.ContextVar(
+    "gateway_request_blocking_in_flight", default=None,
+)
 
 
 class GatewayRuntime:
@@ -304,7 +315,10 @@ class GatewayRuntime:
                 StatusCode.EXTENSION_LOAD_FAILED, reason="the prepared switch ended before it was committed",
             )
         package, activation = prepared.package, prepared.activation
-        registered = self._register_batch(package, lambda declaration: _async_handler(declaration.handler, activation))
+        registered = self._register_batch(
+            package,
+            lambda declaration: _async_handler(declaration.handler, activation, on_failure=declaration.on_failure),
+        )
         self._prepared.discard(prepared)
         self.unpublish(package.package_id)
         activation.registered = registered
@@ -614,6 +628,8 @@ class GatewayRuntime:
             payload = await self.browser.platform_frame(request, self._session_context(request))
             await self._respond(ws, req_id, ok=True, payload=payload)
             return True, dict(params)
+        in_flight: set[str] = set()
+        token = _BLOCKING_IN_FLIGHT.set(in_flight)
         try:
             if self.browser.enabled:
                 await self.browser.connect(ws, connection_id)
@@ -625,8 +641,20 @@ class GatewayRuntime:
                 timeout=REQUEST_TIMEOUT_S,
             )
         except asyncio.TimeoutError:
+            if in_flight:
+                # A handler that blocks on failure did not decide in time: its policy is not bypassed.
+                logger.warning(
+                    "[GatewayExtensions] gateway.request timed out after %.1fs, frame refused "
+                    "(on_failure=block): method=%s ws_id=%s packages=%s",
+                    REQUEST_TIMEOUT_S,
+                    method,
+                    connection_id,
+                    ",".join(sorted(in_flight)),
+                )
+                await self._respond(ws, req_id, ok=False, error=_extension_failed(sorted(in_flight)[0]))
+                return True, dict(params)
             logger.warning(
-                "[GatewayExtensions] gateway.request timed out after %.1fs: method=%s ws_id=%s",
+                "[GatewayExtensions] gateway.request timed out after %.1fs, frame continues: method=%s ws_id=%s",
                 REQUEST_TIMEOUT_S,
                 method,
                 connection_id,
@@ -635,6 +663,8 @@ class GatewayRuntime:
         except Exception as exc:  # noqa: BLE001 - a broken chain must not break the frame
             logger.warning("[GatewayExtensions] gateway.request failed: method=%s err=%s", method, exc)
             return False, dict(params)
+        finally:
+            _BLOCKING_IN_FLIGHT.reset(token)
         return await self._apply(ws, req_id, request, result)
 
     async def _apply(
@@ -858,8 +888,26 @@ async def _pass_on(event: Any, ops: Any, event_next: Any) -> Any:
     return await event_next(event)
 
 
-def _async_handler(handler: Callable[..., Any], activation: _Activation) -> Callable[..., Awaitable[Any]]:
-    """Return a handler the event bus can await, counted against its activation."""
+def _async_handler(
+    handler: Callable[..., Any],
+    activation: _Activation,
+    *,
+    on_failure: str | None = None,
+) -> Callable[..., Awaitable[Any]]:
+    """Return a handler the event bus can await, counted against its activation.
+
+    A ``gateway.request`` handler declared with ``on_failure="block"`` turns its
+    own failure into a refusal of the frame: an exception or an unusable result
+    becomes a ``deny`` with ``EXTENSION_FAILED``, and a call still running when
+    the request timeout ends is reported to ``intercept``, which refuses the
+    frame. Every other handler fails as before: the event bus skips it.
+    """
+
+    async def call(event: Any, ops: Any, event_next: Any) -> Any:
+        result = handler(event, ops, event_next)
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
     @functools.wraps(handler)
     async def adapter(event: Any, ops: Any, event_next: Any) -> Any:
@@ -868,14 +916,66 @@ def _async_handler(handler: Callable[..., Any], activation: _Activation) -> Call
             return await event_next(event)
         activation.enter(ops)
         try:
-            result = handler(event, ops, event_next)
-            if inspect.isawaitable(result):
-                return await result
-            return result
+            if on_failure != ON_FAILURE_BLOCK or getattr(event, "event_type", None) != EVENT_GATEWAY_REQUEST:
+                try:
+                    return await call(event, ops, event_next)
+                except Exception as exc:
+                    if getattr(event, "event_type", None) == EVENT_GATEWAY_REQUEST:
+                        logger.warning(
+                            "[GatewayExtensions] gateway.request handler failed, frame continues "
+                            "(on_failure=continue): package=%s err=%s",
+                            activation.package_id,
+                            exc,
+                        )
+                    raise
+            return await _call_blocking(call, activation.package_id, event, ops, event_next)
         finally:
             activation.leave()
 
     return adapter
+
+
+async def _call_blocking(call: Callable[..., Awaitable[Any]], package_id: str,
+                         event: Any, ops: Any, event_next: Any) -> Any:
+    """Run a blocking ``gateway.request`` handler; its failure refuses the frame."""
+
+    in_flight = _BLOCKING_IN_FLIGHT.get()
+    try:
+        result = await call(event, ops, event_next)
+    except asyncio.CancelledError:
+        # The request timeout cancelled the chain while this handler had not decided.
+        if in_flight is not None:
+            in_flight.add(package_id)
+        raise
+    except Exception as exc:  # noqa: BLE001 - the handler chose to refuse the frame on failure
+        logger.warning(
+            "[GatewayExtensions] gateway.request handler failed, frame refused (on_failure=block): "
+            "package=%s err=%s",
+            package_id,
+            exc,
+        )
+        return _refusal(package_id)
+    if not isinstance(result, GatewayRequestOutput) or GatewayRoute.parse(result.route) is None:
+        logger.warning(
+            "[GatewayExtensions] gateway.request handler returned an unusable result, frame refused "
+            "(on_failure=block): package=%s result=%r",
+            package_id,
+            result,
+        )
+        return _refusal(package_id)
+    return result
+
+
+def _extension_failed(package_id: str) -> dict[str, Any]:
+    return {
+        "code": CODE_EXTENSION_FAILED,
+        "message": f"the request check of extension {package_id} failed; try again",
+        "status": STATUS_EXTENSION_FAILED,
+    }
+
+
+def _refusal(package_id: str) -> GatewayRequestOutput:
+    return GatewayRequestOutput(handled=True, route=GatewayRoute.DENY.value, error=_extension_failed(package_id))
 
 
 def _host_version() -> str | None:
