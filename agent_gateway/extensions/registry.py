@@ -244,6 +244,8 @@ class ExtensionRegistry:
         media_attachment_normalizer: Callable[[dict[str, Any], str | None], Awaitable[None]]
         | None = None,
     ) -> None:
+        from dataclasses import replace
+
         from agent_gateway.extensions.sdk.application_plugin import (
             ApplicationPluginServices,
         )
@@ -252,8 +254,13 @@ class ExtensionRegistry:
             agent_client=agent_client,
             media_attachment_normalizer=media_attachment_normalizer,
         )
-        for plugin in self.get_application_plugins():
-            plugin.bind_web_channel(_ApplicationPluginChannel(channel, plugin), services)
+        for plugin_id, plugin in tuple(self._application_plugins.items()):
+            # Each plugin gets its own id in its services, so a call it makes
+            # through them (such as start_session_turn) names the plugin.
+            plugin.bind_web_channel(
+                _ApplicationPluginChannel(channel, plugin),
+                replace(services, plugin_id=plugin_id),
+            )
         channel.application_plugin_registry = self
 
     def get_agent_server_client_extension(self) -> AgentServerClientExtension | None:

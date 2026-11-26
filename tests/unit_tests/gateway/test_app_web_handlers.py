@@ -3720,3 +3720,31 @@ async def test_task_asr_rejects_invalid_config_protocol(monkeypatch, payload):
     await channel.methods["task.asr.transcribe"](ws, "invalid-config", {}, "session")
     assert channel.responses[-1]["ok"] is False
     assert channel.responses[-1]["code"] == "UPSTREAM_PROTOCOL_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_web_channel_refuses_session_start_turn_from_a_browser() -> None:
+    class _Channel(FakeWebChannel):
+        def __init__(self):
+            super().__init__()
+            self.local_only: set[str] = set()
+
+        def register_method(self, name, handler, *, local_only=False):
+            super().register_method(name, handler, local_only=local_only)
+            if local_only:
+                self.local_only.add(name)
+
+    channel = _bind(_Channel())
+
+    assert "session.start_turn" in channel.local_only
+    await channel.methods["session.start_turn"](
+        object(), "turn-1", {"plugin_id": "mail-watcher", "prompt": "x", "submission_id": "1"},
+        "sess-1", user_id="user-1",
+    )
+    assert channel.responses == [{
+        "id": "turn-1",
+        "ok": False,
+        "payload": None,
+        "error": "session.start_turn is for application plugins",
+        "code": "FORBIDDEN",
+    }]

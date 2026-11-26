@@ -6483,6 +6483,18 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     channel.register_method("heartbeat.job.run_now", _hb_job_run_now)
     channel.register_method("heartbeat.job.cancel", _hb_job_cancel)
 
+    async def _session_start_turn_refused(ws, req_id, params, session_id, user_id=None):
+        # session.start_turn is an application plugin's call over the agent client the Gateway
+        # hands it (ApplicationPluginServices.start_session_turn). A browser that sends it would
+        # start a turn as any plugin, so the Web channel answers it here and forwards nothing.
+        del params, session_id, user_id
+        await channel.send_response(
+            ws, req_id, ok=False, code="FORBIDDEN",
+            error="session.start_turn is for application plugins",
+        )
+
+    channel.register_method("session.start_turn", _session_start_turn_refused, local_only=True)
+
     # 数字分身 — permissions.owner_scopes：A5 起统一经目标 AgentServer 的
     # ConfigAdapter 执行（写入后 server 侧 in-process reload）。
     # 其余 permissions.*（tools / rules / approval_overrides）走 _forward_permissions_to_agent。
