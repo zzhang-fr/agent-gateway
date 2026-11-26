@@ -47,6 +47,7 @@ from openjiuwen.core.extension.data.json_values import valid_package_id
 from agent_gateway.extensions_v2 import bootstrap
 from agent_gateway.extensions_v2.builtin.router import GatewayLocalRouter, LocalRequest
 from agent_gateway.extensions_v2.config import GatewayExtensionConfig
+from agent_gateway.extensions_v2.lifecycle import START, STOP, PackageLifecycle
 from agent_gateway.extensions_v2.loader import LoadedPackage, load_gateway_packages, release_package_modules
 from agent_gateway.extensions_v2.registry import HandlerDeclaration
 from agent_gateway.extensions_v2.models import (
@@ -109,6 +110,8 @@ class GatewayRuntime:
         self._closed = False
         self._management: Any = None
         self._started = False
+        # Package start() and stop() hooks, in order per package and within a time limit.
+        self.lifecycle = PackageLifecycle(config.lifecycle_timeout)
         self.browser = BrowserBridge(self)
 
     @property
@@ -179,7 +182,7 @@ class GatewayRuntime:
         # No switch is prepared from here on, and one prepared earlier can no longer commit.
         self._closed = True
         for prepared in self._prepared:
-            prepared.activation.release()
+            self._release(prepared.activation)
         self._prepared.clear()
         user_ids = [handler_id for activation in self._activations.values() for handler_id in activation.registered]
         for handler_id in (*user_ids, *self._builtin_ids):
@@ -189,8 +192,10 @@ class GatewayRuntime:
                 logger.warning("[GatewayExtensions] failed to unregister %s: %s", handler_id, exc)
         self._builtin_ids.clear()
         for activation in self._activations.values():
-            activation.release()
+            self._release(activation)
         self._activations.clear()
+        # Every package's stop() ends (or reaches its time limit) before the runtime goes away.
+        await self.lifecycle.settle_all()
         self.browser.presentations.invalidate()
         await self.browser.settle()
         await self.browser.close()
@@ -279,6 +284,8 @@ class GatewayRuntime:
             self._drop_handlers(self._register_batch(package, lambda declaration: _pass_on))
         except Exception:
             release_package_modules(package)
+            # register() already ran; the package may have started work there.
+            self.lifecycle.schedule(package, STOP)
             raise
         activation = _Activation(package, uuid4().hex, application=self.browser.is_application_package(package),
                                  ops_owner=self._ops_owner, inflight=self._inflight)
@@ -311,12 +318,14 @@ class GatewayRuntime:
         self._activations[package.package_id] = activation
         self._generations[package.package_id] = self._generations.get(package.package_id, 0) + 1
         self.browser.published(package.package_id)
+        # Runs after the replaced version's stop(), which unpublish() scheduled above.
+        self.lifecycle.schedule(package, START)
 
     def abort(self, prepared: PreparedPackage) -> None:
         """Drop a prepared package that will not be committed; the running version is untouched."""
 
         self._prepared.discard(prepared)
-        prepared.activation.release()
+        self._release(prepared.activation)
 
     def _register_batch(self, package: LoadedPackage,
                         handler_for: Callable[[HandlerDeclaration], Callable[..., Any]]) -> tuple[str, ...]:
@@ -360,12 +369,26 @@ class GatewayRuntime:
         if activation is None:
             return False
         self._drop_handlers(activation.registered)
-        activation.release()
+        self._release(activation)
         # The release frames keep the generation of the record being dropped: the browser
         # still holds that declaration, so a clear without it would be rejected (S_06).
         generation = activation.generation if activation.package.client else None
         self.browser.released(package_id, generation=generation)
         return True
+
+    def _release(self, activation: _Activation) -> None:
+        """Release an activation and schedule its package's stop(), once per activation."""
+
+        if activation.release():
+            self.lifecycle.schedule(activation.package, STOP)
+
+    async def settle_package(self, package_id: str) -> None:
+        """Wait until the start() and stop() hooks scheduled so far for ``package_id`` have ended.
+
+        Each hook has a time limit (``lifecycle_timeout``), so the wait is bounded.
+        """
+
+        await self.lifecycle.settle(package_id)
 
     def _drop_handlers(self, registered: Sequence[str]) -> None:
         """Unregister handler ids; a stale id is logged and the rest still go."""
@@ -841,9 +864,13 @@ class _Activation:
         _count(self._inflight, self.package_id, -1)
         self._purge_when_idle()
 
-    def release(self) -> None:
+    def release(self) -> bool:
+        """Mark the activation released; True only for the first call."""
+
+        first = not self._released
         self._released = True
         self._purge_when_idle()
+        return first
 
     def _purge_when_idle(self) -> None:
         if self._released and self._running == 0 and not self._purged:

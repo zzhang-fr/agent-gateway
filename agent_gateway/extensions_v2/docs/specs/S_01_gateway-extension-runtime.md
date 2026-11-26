@@ -37,6 +37,7 @@
 | `http.max_body_bytes` | int | `1048576` | 上限 `4194304`；非法值回落默认 |
 | `http.follow_redirects` | bool | `false` | 非布尔值回落 `false` |
 | `uploads.max_bytes` | int | `536870912` | 一次文件导入的总大小；上限 `4294967296`；非法值回落默认，见 [S_10](S_10_application-settings.md) |
+| `lifecycle_timeout` | number | `5` | 包的一次 `start()` 或 `stop()` 最多等待的秒数；上限 `60`；非正数或非数值回落默认，见第 3.3 节 |
 
 配置读取异常时不抛错，等价于空配置。
 客户端浏览器能力随包安装激活直接可用，无需额外授权配置；详见 [浏览器接入规约](S_06_local-browser-bridge.md)。
@@ -116,6 +117,26 @@ Handler 接收 `(event, ops, next_handler)`，事件输入位于 `event.event_in
 
 与 AgentServer 的差异：AgentServer 已开始的管理操作被取消时，报告保留“结果未知”，由调用方查询当前状态后再决定（AgentServer F_11）；
 Gateway 过了提交点会先完成收尾再抛出取消，调用方收到的仍是取消，结果以查询到的包状态为准。
+
+### 3.3 包的启动与停止
+
+扩展对象（`create_extension()` 的返回值）可以另外定义无参的 `start()` 与 `stop()`，同步函数或 `async` 函数均可；都不定义的包行为不变。
+包在 `register` 之外持有的资源（子进程、线程、套接字、定时器、后台任务）在 `start()` 中启动，在 `stop()` 中结束；
+否则卸载、停用或升级之后它们会在已删除的副本上继续运行，并与新版本争用端口。
+
+| 时机 | 调用 |
+| --- | --- |
+| 包发布（启动加载、安装、启用、重载、新版本切换的提交） | 新激活的 `start()` |
+| 激活释放（卸载、停用、重载或新版本替换、停机，以及准备后放弃） | 该激活的 `stop()`，每个激活至多一次；`register()` 已执行但未发布的版本同样调用 |
+
+同一个包的调用按顺序执行：被替换版本的 `stop()` 结束后，新版本的 `start()` 才开始。管理操作等待这些调用结束后才返回结果：
+卸载在删除数据目录与安装副本之前等待 `stop()`，停用在返回之前等待 `stop()`，切换在返回之前等待旧版本 `stop()` 与新版本 `start()`；
+停机在注销全部 Handler 后等待所有包的 `stop()`。
+
+每次调用受 `lifecycle_timeout` 限制。`async` 函数在 Gateway 的事件循环上运行，超时即被取消，适合取消包自己创建的 asyncio 任务；
+同步函数在独立的守护线程中运行，不阻塞事件循环，适合结束子进程（先 `terminate()`，在时限内 `wait()`，必要时 `kill()`）。
+超时只写警告日志并继续，抛出的异常只写错误日志；两者都不改变管理操作的结果。
+Gateway 进程被强制结束（如 `SIGKILL`）时不会调用 `stop()`，包仍须让自己需要恢复的状态持久化。
 
 ## 4. 事件契约
 
@@ -212,6 +233,8 @@ USER handler 返回 `deny` 或 `consume` 时，内层 UI 分派器及 CORE 均�
     过了提交点（开始关闭旧开场）的安装、重载与卸载即使被取消（包括重复取消）也保证收尾，收尾结束后调用方才收到取消；
     安装副本只在新版本提交后保留；卸载收尾时第二次忙检查仍可能拒绝卸载，此时开场已关闭、包继续运行。
     停机后不能提交已有准备项，也不能新建准备项。卸载删除包数据前只等待本包导入目录的后台删除，其他包的浏览器通知或文件清理不会拖住卸载。
+15. 每个激活的 `stop()` 至多调用一次，`start()` 只在发布后调用；同一包的调用按顺序执行，旧版本的 `stop()` 结束后新版本的 `start()` 才开始。
+    卸载在 `stop()` 结束（或超过 `lifecycle_timeout`）之后才删除数据目录与安装副本；钩子的超时与异常不改变管理操作的结果（第 3.3 节）。
 
 ## 10. 验证索引
 
@@ -228,6 +251,7 @@ USER handler 返回 `deny` 或 `consume` 时，内层 UI 分派器及 CORE 均�
 | 出站 HTTP 白名单与预算 | `test_gateway_http_fetch.py`（契约细节见 [S_05](S_05_http-fetch.md)） |
 | 包存储、数据目录、数据素材与卸载清理；在途调用与已释放激活的数据调用（不变量 12） | `test_gateway_package_data.py` |
 | 版本切换：准备与提交、一条事件链只经过一个版本、提交点后的取消收尾、停机终止准备项（第 3.2 节、不变量 14） | `test_gateway_application_settings.py`、`test_gateway_package_data.py` |
+| 包的 `start()` / `stop()`：卸载、停用、切换、重载与停机的调用顺序与次数，时限与异常，后台进程随包结束（第 3.3 节、不变量 15） | `test_gateway_package_lifecycle_hooks.py` |
 | 应用级 UI 包与素材路由 | `test_gateway_application_assets.py` |
 | 包释放通知、受控外观与重载广播 | `test_gateway_appearance.py`、`test_gateway_package_management.py`（契约细节见 [S_08](S_08_appearance.md)） |
 | 宿主方法、开场偏好、导入与导出 | `test_gateway_application_settings.py`、`test_gateway_file_transfer.py`（契约细节见 [S_10](S_10_application-settings.md)） |

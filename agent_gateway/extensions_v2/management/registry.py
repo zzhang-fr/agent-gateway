@@ -414,6 +414,7 @@ class GatewayPackageManager:
         root = self._find_root(package_id, version)
         if root is None:
             self._runtime.unpublish(package_id)
+            await self._runtime.settle_package(package_id)
             return _success(package_id, "disable", active=None)
         manifest = load_manifest(root, require_domain=True)
         if self._report is not None:
@@ -545,6 +546,8 @@ class GatewayPackageManager:
                 self._runtime.require_idle(package_id)
                 await self._close_splashes(package_id)
                 self._runtime.stop_package(package_id)
+                # The package's stop() ends before its copy is deleted.
+                await self._runtime.settle_package(package_id)
             await asyncio.to_thread(self._remove_with_retry, package_id, version, missing_ok=True)
         except ExtensionFailure as exc:
             return _failure(package_id, "uninstall", exc.as_error())
@@ -584,6 +587,8 @@ class GatewayPackageManager:
             if is_active:
                 await self._close_splashes(package_id)
                 self._runtime.stop_package(package_id)
+                # The package's stop() ends before its copy is deleted.
+                await self._runtime.settle_package(package_id)
             with service.operation_scope(token):
                 await run_file_operation(
                     lambda: self._remove_with_retry(package_id, version, missing_ok=True)
@@ -836,6 +841,7 @@ class GatewayPackageManager:
                         )
             else:
                 released = self._runtime.unpublish(package_id)
+                await self._runtime.settle_package(package_id)
                 if released and self._on_released is not None:
                     try:
                         self._on_released(package_id)
@@ -1008,6 +1014,8 @@ class GatewayPackageManager:
         try:
             await self._close_splashes(package_id)
             self._runtime.stop_package(package_id)
+            # The package's stop() ends before its data and copies are deleted.
+            await self._runtime.settle_package(package_id)
             # Data goes first: if it cannot be removed the copies stay, so a repeated
             # uninstall can retry instead of reporting "not installed".
             try:
@@ -1079,6 +1087,8 @@ class GatewayPackageManager:
 
         prepared = self._runtime.prepare(package)
         await _run_to_end(self._finish_switch(prepared))
+        # The replaced version's stop() and this version's start() end before the switch reports.
+        await self._runtime.settle_package(package.package_id)
 
     async def _finish_switch(self, prepared: Any) -> None:
         try:
@@ -1261,6 +1271,8 @@ class GatewayPackageManager:
             released = self._runtime.stop_package(package_id)
         except ExtensionFailure as exc:
             return _failure(package_id, "uninstall", exc.as_error())
+        # The package's stop() ends before its data and copies are deleted.
+        await self._runtime.settle_package(package_id)
         if not versions and not released:
             return _failure(
                 package_id,
@@ -1335,6 +1347,7 @@ class GatewayPackageManager:
         del root
         package_id = manifest.package_id
         released = self._runtime.unpublish(package_id)
+        await self._runtime.settle_package(package_id)
         self._store.set_enabled(package_id, manifest.version, False)
         if released and self._on_released is not None:
             try:
