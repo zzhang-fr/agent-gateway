@@ -17,6 +17,8 @@ class ApplicationPluginServices:
     media_attachment_normalizer: (
         Callable[[dict[str, Any], str | None], Awaitable[None]] | None
     ) = None
+    # The id of the plugin these services were bound for; the Gateway sets it.
+    plugin_id: str = ""
 
     def require_agent_client(self) -> Any:
         """Return the registered Core Agent client or fail during plugin binding."""
@@ -24,6 +26,36 @@ class ApplicationPluginServices:
         if self.agent_client is None:
             raise RuntimeError("application plugin requires the Core Agent service")
         return self.agent_client
+
+    async def start_session_turn(
+        self,
+        *,
+        session_id: str,
+        prompt: str,
+        submission_id: str,
+        display_text: str = "",
+        agent_template_name: str = "",
+        user_id: str = "",
+    ) -> dict[str, Any]:
+        """Start a turn in ``session_id`` as this plugin (``session.start_turn``).
+
+        See ``agent_gateway.extensions.sdk.session_turn.start_session_turn``.
+        """
+
+        from agent_gateway.extensions.sdk.session_turn import start_session_turn
+
+        if not self.plugin_id:
+            raise RuntimeError("session turn requires the plugin id the Gateway binds")
+        return await start_session_turn(
+            self.require_agent_client(),
+            plugin_id=self.plugin_id,
+            session_id=session_id,
+            prompt=prompt,
+            submission_id=submission_id,
+            display_text=display_text,
+            agent_template_name=agent_template_name,
+            user_id=user_id,
+        )
 
     async def normalize_media_attachments(
         self,

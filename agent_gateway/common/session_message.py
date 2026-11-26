@@ -17,6 +17,9 @@ _CROSS_SESSION_HISTORY_FIELDS = (
     "parent_message_id",
     "hop_count",
     "language",
+    # A turn an application plugin started (session.start_turn).
+    "plugin_id",
+    "display_text",
 )
 
 

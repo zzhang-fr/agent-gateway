@@ -70,3 +70,6 @@ _ensure_req_method("WORKSPACE_PREVIEW", "workspace.preview")
 _ensure_req_method("WORKSPACE_USAGE", "workspace.usage")
 _ensure_req_method("WORKSPACE_ENTRIES_DELETE", "workspace.entries.delete")
 _ensure_req_method("VIDEO_CONVERSATION_APPEND", "video.conversation.append")
+# An application plugin starts a turn in a Session through the AgentServer's Session mailbox
+# (agent_gateway.extensions.sdk.session_turn).
+_ensure_req_method("SESSION_START_TURN", "session.start_turn")
