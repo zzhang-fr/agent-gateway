@@ -63,6 +63,9 @@ class LoadedPackage:
     module_names: tuple[str, ...] = ()
     domain: str = DEFAULT_DOMAIN
     requires_packages: tuple[PackageDependency, ...] = ()
+    #: The objects ``create_extension()`` returned, in entry order. The runtime calls their optional
+    #: ``start()`` once the package is published and their optional ``stop()`` once it is released.
+    extensions: tuple[Any, ...] = field(default=(), compare=False, repr=False)
 
 
 def load_gateway_packages(install_dir: Path) -> list[LoadedPackage]:
@@ -77,11 +80,11 @@ def load_gateway_packages(install_dir: Path) -> list[LoadedPackage]:
             if not manifest["enable"]:
                 continue
             ensure_swarm_compatible(manifest["compatibility"])
-            handlers, module_names = _load_handlers(root, manifest["modules"])
+            handlers, module_names, extensions = _load_handlers(root, manifest["modules"])
         except Exception as exc:  # noqa: BLE001 - one bad package must not block startup
             logger.warning("[GatewayExtensions] skipping package %s: %s", root, exc)
             continue
-        loaded.append(_package_from(root, manifest, handlers, module_names))
+        loaded.append(_package_from(root, manifest, handlers, module_names, extensions))
     return loaded
 
 
@@ -94,8 +97,8 @@ def load_gateway_package(root: Path) -> LoadedPackage:
     if not manifest["enable"]:
         raise ValueError(f"{root} is disabled")
     ensure_swarm_compatible(manifest["compatibility"])
-    handlers, module_names = _load_handlers(Path(root), manifest["modules"])
-    return _package_from(Path(root), manifest, handlers, module_names)
+    handlers, module_names, extensions = _load_handlers(Path(root), manifest["modules"])
+    return _package_from(Path(root), manifest, handlers, module_names, extensions)
 
 
 def release_package_modules(package: LoadedPackage) -> None:
@@ -109,6 +112,7 @@ def _package_from(
     manifest: Mapping[str, Any],
     handlers: list[HandlerDeclaration],
     module_names: tuple[str, ...] = (),
+    extensions: tuple[Any, ...] = (),
 ) -> LoadedPackage:
     return LoadedPackage(
         package_id=manifest["package_id"],
@@ -121,6 +125,7 @@ def _package_from(
         module_names=module_names,
         domain=manifest["domain"],
         requires_packages=manifest["requires"],
+        extensions=extensions,
     )
 
 
@@ -303,23 +308,26 @@ def _next_load_serial() -> int:
         return next(_LOAD_SERIAL)
 
 
-def _load_handlers(root: Path, modules: tuple[str, ...]) -> tuple[list[HandlerDeclaration], tuple[str, ...]]:
-    """Execute every entry and return its declarations with the root module names it created."""
+def _load_handlers(
+    root: Path, modules: tuple[str, ...],
+) -> tuple[list[HandlerDeclaration], tuple[str, ...], tuple[Any, ...]]:
+    """Execute every entry; return its declarations, the root module names it created and the extension objects."""
 
     registrar = GatewayRegistrar()
     serial = f"{hashlib.sha256(str(root).encode('utf-8')).hexdigest()[:8]}-{_next_load_serial()}-"
     roots: list[str] = []
+    extensions: list[Any] = []
     try:
         for index, module in enumerate(modules):
             name = _module_name(root.name, module, f"{serial}{index}")
             roots.append(name)
             entry_name, _ = _load_entry(name, root, _module_relative(module))
-            _call_register(entry_name, registrar)
+            extensions.append(_call_register(entry_name, registrar))
     except Exception:
         # Earlier entries of the same package are released as well.
         _release_modules(roots)
         raise
-    return list(registrar.declarations), tuple(roots)
+    return list(registrar.declarations), tuple(roots), tuple(extensions)
 
 
 def _module_name(version: str, module: str, serial: str) -> str:
@@ -327,7 +335,7 @@ def _module_name(version: str, module: str, serial: str) -> str:
     return f"agent_gateway_ext_{hashlib.sha256(raw).hexdigest()[:24]}"
 
 
-def _call_register(module_name: str, registrar: GatewayRegistrar) -> None:
+def _call_register(module_name: str, registrar: GatewayRegistrar) -> Any:
     module = sys.modules[module_name]
     factory = getattr(module, "create_extension", None)
     if not callable(factory):
@@ -337,6 +345,7 @@ def _call_register(module_name: str, registrar: GatewayRegistrar) -> None:
     if not callable(register):
         raise ValueError(f"{module_name} create_extension() result has no register method")
     register(registrar)
+    return extension
 
 
 # ── module loading ────────────────────────────────────────────────────────

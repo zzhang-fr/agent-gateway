@@ -38,6 +38,9 @@ MAX_HTTP_BODY_BYTES = 4 * 1024 * 1024
 #: Total bytes of one file import (S_10 section 8).
 DEFAULT_UPLOAD_MAX_BYTES = 512 * 1024 * 1024
 MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024
+#: Seconds one package ``start()`` or ``stop()`` may take before the Gateway goes on without it.
+DEFAULT_LIFECYCLE_TIMEOUT = 5.0
+MAX_LIFECYCLE_TIMEOUT = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +111,8 @@ class GatewayExtensionConfig:
     poll_interval: float = 0.5
     dependency_timeout: float = 300.0
     lock_timeout: float = 5.0
+    #: ``lifecycle_timeout``: seconds one package ``start()`` or ``stop()`` may take.
+    lifecycle_timeout: float = DEFAULT_LIFECYCLE_TIMEOUT
 
 
 def load_gateway_config(config: Mapping[str, Any] | None = None) -> GatewayExtensionConfig:
@@ -148,6 +153,9 @@ def load_gateway_config(config: Mapping[str, Any] | None = None) -> GatewayExten
         poll_interval=settings.poll_interval,
         dependency_timeout=settings.dependency_timeout,
         lock_timeout=settings.lock_timeout,
+        lifecycle_timeout=_bounded_seconds(
+            gateway.get("lifecycle_timeout"), DEFAULT_LIFECYCLE_TIMEOUT, MAX_LIFECYCLE_TIMEOUT,
+        ),
     )
 
 
@@ -200,6 +208,12 @@ def _bounded_int(value: Any, default: int, upper: int) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         return default
     return min(value, upper)
+
+
+def _bounded_seconds(value: Any, default: float, upper: float) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 < value < float("inf"):
+        return default
+    return min(float(value), upper)
 
 
 def _resolve_dir(raw: str) -> Path:
