@@ -49,8 +49,10 @@ async def intercept_gateway_frame(
     ``headers`` carries ``request_context.headers`` from the browser frame so the
     USER handlers can validate credentials.
     ``visited=True`` means the frame was answered by the extension runtime and
-    the native dispatch must be skipped. Any failure fails open: the frame
-    continues on the path it would have taken without extensions.
+    the native dispatch must be skipped. A failure fails open: the frame
+    continues on the path it would have taken without extensions. A handler
+    registered with ``on_failure="block"`` chooses the other way: when it
+    fails, the frame is refused with ``EXTENSION_FAILED``.
     """
 
     from agent_gateway.extensions_v2.assembly import get_gateway_runtime
