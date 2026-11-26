@@ -63,6 +63,21 @@ def test_pdf_disguised_as_txt_is_not_inlined(tmp_path: Path) -> None:
     assert "Issue 6122" not in result
 
 
+def test_pdf_reference_names_the_pdf_reading_tool(tmp_path: Path) -> None:
+    path = tmp_path / "scan.pdf"
+    path.write_bytes(PDF_BYTES)
+
+    result = MessageHandler.resolve_at_file_references(
+        f"read @{path.name}",
+        cwd=str(tmp_path),
+    )
+
+    assert 'type="PDF"' in result
+    assert "Use the read_pdf tool to read PDF text by page" in result
+    assert "no text layer" in result
+    assert "document reading tool" not in result
+
+
 @pytest.mark.parametrize("header_offset", [1, 512, 1016, 1023])
 def test_pdf_header_with_leading_bytes_is_not_inlined(
     tmp_path: Path,

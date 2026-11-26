@@ -56,6 +56,9 @@ _MAGIC_TYPES = (
     (b"SQLite format 3\x00", "binary"),
 )
 
+# The document tool the agent host offers for PDF files; named in the notice of a PDF reference.
+PDF_READING_TOOL = "read_pdf"
+
 
 @dataclass(frozen=True)
 class InlineFile:
@@ -120,7 +123,10 @@ def file_reference(path: Path, file_type: str, reason: str) -> str:
     elif reason == "truncated_empty":
         notice = "Content not inlined: the byte limit removed all text at the truncation boundary. Use a file reading tool to read the file."
     elif file_type == "PDF":
-        notice = "Content not inlined. Use a document reading tool to read PDF text by page as needed."
+        notice = (
+            f"Content not inlined. Use the {PDF_READING_TOOL} tool to read PDF text by page as needed. "
+            "It marks pages that have no text layer, such as scanned images, and reports a file it cannot read."
+        )
     else:
         notice = "Content not inlined. Use an appropriate document, media or file reading tool as needed."
     return (
